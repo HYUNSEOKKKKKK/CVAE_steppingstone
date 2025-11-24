@@ -3,12 +3,117 @@ import math
 import os
 import random
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Iterable
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from matplotlib.patches import Patch
+from matplotlib.colors import Normalize
+import json, math
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional, Iterable
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+
+def vae_seq_to_terrain_json(seq: List["Step6"],
+                            center0=(0.0,0.0,0.0),
+                            size0=(0.30,0.30),
+                            yaw0_deg=0.0,
+                            terrain_key: str = "vae_run",
+                            json_path: str | Path = "vae_terrain.json",
+                            use_from: int = 2,
+                            copy_counts: List[int] | None = None):
+    """
+    CVAE seq -> load_terrain() 호환 JSON 파일 생성
+    - use_from=2 : 시드 델타 2개(d0,d1)를 제외한 실제 생성분만 지형에 반영
+    - copy_counts: 필요 없으면 None. 쓰고 싶으면 len(stones)와 동일 길이로.
+    """
+    centers, sizes, yaws = deltas_to_absolute_6d(seq, center0, size0, yaw0_deg)
+
+    stones: List[Dict[str, Any]] = []
+    for i, ((cx,cy,cz), (w,h), yaws) in enumerate(zip(centers[use_from:], sizes[use_from:], yaws[use_from:]), start=1):
+        stones.append({
+            "name": f"stone_{i}",
+            "center": [float(cx), float(cy), float(cz)],  # (x,y,z)
+            "width":  float(w),
+            "height": float(h),
+            "yaw_deg": float(yaws),
+            # NOTE: 스키마에는 yaw 없음. 필요하면 아래 확장 팁 참고.
+        })
+
+    # 파일 구조: { "<terrain_key>": {"stones": [...], "copy_counts": [...] } }
+    obj = {
+        terrain_key: {
+            "stones": stones
+        }
+    }
+    if copy_counts is not None:
+        if len(copy_counts) != len(stones):
+            raise ValueError(f"copy_counts length {len(copy_counts)} != stones {len(stones)}")
+        obj[terrain_key]["copy_counts"] = [int(x) for x in copy_counts]
+
+    json_path = Path(json_path)
+    # 기존 파일이 있으면 합쳐서 갱신(동일 키는 덮어씀)
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                base = json.load(f)
+            if not isinstance(base, dict):
+                base = {}
+        except Exception:
+            base = {}
+        base[terrain_key] = obj[terrain_key]
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(base, f, ensure_ascii=False, indent=2)
+    else:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+
+    return str(json_path), terrain_key
+
+
+
+# 네가 쓰는 Step6: (dx,dy,dz,dw,dh,dyaw[deg]) 라고 가정
+# class Step6: ...  # 이미 있겠지만, 여기서는 속성만 사용
+
+def deltas_to_absolute_6d(seq: List["Step6"],
+                          center0: Tuple[float,float,float],
+                          size0: Tuple[float,float],
+                          yaw0_deg: float = 0.0):
+    """
+    6D 델타 -> 절대치 (완전 독립 버전)
+    - x,y: dx,dy를 회전 없이 월드 좌표계에서 그대로 누적
+    - z: dz만 누적
+    - yaw: dyaw만 누적 (x,y에 영향 없음)
+    - w,h: dw,dh만 누적 (yaw/xy에 영향 없음)
+    반환 길이: len(seq)
+    """
+    x, y, z = map(float, center0)
+    w, h = map(float, size0)
+    yaw_deg = float(yaw0_deg)
+
+    centers, sizes, yaws = [], [], []
+    MIN_W, MIN_H = 0.05, 0.05
+
+    for s in seq:
+        # 위치: 회전 영향 없이 독립
+        x += float(s.dx)
+        y += float(s.dy)
+        z += float(s.dz)
+
+        # 크기: 독립
+        w = max(MIN_W, w + float(s.dw))
+        h = max(MIN_H, h + float(s.dh))
+
+        # 방향: 독립
+        yaw_deg += float(s.dyaw)
+
+        centers.append((x, y, z))
+        sizes.append((w, h))
+        yaws.append(yaw_deg)
+
+    return centers, sizes, yaws
 
 # ============================
 # 1) Data & utilities (6D: dx,dy,dz,dw,dh,dyaw_deg)
@@ -91,12 +196,12 @@ class SyntheticStepDeltaDataset(Dataset):
 
         def sample_delta(prev: Optional[Step6], prev2: Optional[Step6]) -> Step6:
             # 기본 균등 + 연속성(약한 AR)
-            dx   = g.uniform(0.10, 0.30)
-            dy   = g.uniform(-0.10, 0.10)
-            dz   = g.uniform(-0.05, 0.05)
+            dx   = g.uniform(0.30, 0.60)
+            dy   = g.uniform(-0.15, 0.15)
+            dz   = g.uniform(-0.1, 0.1)
             dw   = g.uniform(-0.06, 0.05)
             dh   = g.uniform(-0.06, 0.05)
-            dyaw = g.uniform(-90, 90)   # °
+            dyaw = g.uniform(-90, 90)   # °-90,90
 
             if prev:
                 # 약한 관성(이전 델타와 섞기) — 위치/크기: 선형, 각도: 최단각 기반
@@ -398,142 +503,212 @@ def deltas_to_absolute(
         return centers, sizes, None
 
 
-
-
-# ============================
-# 6) Visualization helpers
-# ============================
-
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from matplotlib.ticker import MaxNLocator
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import numpy as np
-
-
-def _Rx(a):
+# -------- rotation (z-axis) --------
+def _Rz_deg(deg: float) -> np.ndarray:
+    a = math.radians(deg)
     ca, sa = math.cos(a), math.sin(a)
-    return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]], dtype=float)
+    return np.array([[ca, -sa, 0.0],
+                     [sa,  ca, 0.0],
+                     [0.0, 0.0, 1.0]], dtype=float)
 
-def _Ry(a):
-    ca, sa = math.cos(a), math.sin(a)
-    return np.array([[ca,0,sa],[0,1,0],[-sa,0,ca]], dtype=float)
-
-def _Rz(a):
-    ca, sa = math.cos(a), math.sin(a)
-    return np.array([[ca,-sa,0],[sa,ca,0],[0,0,1]], dtype=float)
-
-
-import matplotlib.colors as mcolors
-
-def plot_sequence_3d_deltas(
-    seq: List[Step6],
-    center0=(0,0,0),
-    size0=(0.35,0.25),
-    thickness: float = 0.04,
-    title="Generated (3D)",
-    yaw0_deg: float = 0.0,
-    tilt_x_deg: float = 0.0,
-    tilt_y_deg: float = 0.0,
-    # --- 새로 추가: 시작/마지막 스톤 색상 (연한 톤)
-    start_color="lightgreen",   # 1번 스톤
-    goal_color="#FFB3B3",       # 마지막 스톤(연한 빨강)
-    equalize_axes: bool = True,
-):
-    # yaw 포함해서 누적
-    centers, sizes, yaws = deltas_to_absolute(
-        seq, center0=center0, size0=size0, yaw0_deg=yaw0_deg, return_yaw=True
-    )
-
-    # --- z 정규화(그레이스케일용) ---
-    zs = [c[2] for c in centers[1:]] if len(centers) > 1 else [0.0]
-    zmin, zmax = (min(zs), max(zs))
-    eps = 1e-12
-    import matplotlib as mpl
-    norm = mpl.colors.Normalize(vmin=zmin-0.1, vmax=zmax+0.1 if abs(zmax - zmin) > eps else zmin + 1.0)
-    cmap = plt.cm.Greys
-
-    fig = plt.figure(figsize=(7,5))
-    ax = fig.add_subplot(111, projection='3d'); ax.set_title(title)
-    ax.view_init(elev=35, azim=-135)
-    ax.grid(False)
-
-    faces, fcols = [], []
-
-    N = len(centers) - 1  # 플로팅하는 스톤 수(시드 제외)
-
-    # seed(0) 제외하고 1~N 스톤을 회전 포함해 생성
-    for i, (ctr, sz, yaw_deg) in enumerate(zip(centers[1:], sizes[1:], yaws[1:]), start=1):
-        cx, cy, cz = ctr
-        w, h = sz
-
-        # 회전된 상면 꼭짓점 (4x3, 순서: CCW)
-        top = stone_corners_3d(
-            center=(cx, cy, cz),
-            yaw_deg=yaw_deg,
-            tilt_x_deg=tilt_x_deg,
-            tilt_y_deg=tilt_y_deg,
-            size=(w, h)
-        )
-        # 하면: 월드 z축으로 thickness 만큼 아래
-        bottom = top - np.array([0, 0, thickness], dtype=float)
-
-        # --- 색상 선택: 1번/마지막은 지정색, 나머지는 높이-그레이스케일 ---
-        if i == 1:
-            c = mcolors.to_rgba(start_color, alpha=0.9)
-        elif i == N:
-            c = mcolors.to_rgba(goal_color, alpha=0.9)
-        else:
-            c = cmap(norm(cz))
-
-        # 상/하면 추가 (하면은 법선 맞추려 뒤집음)
-        faces += [top, bottom[::-1]]
-        fcols += [c, c]
-
-        # 옆면(4개 면)
-        for k in range(4):
-            k2 = (k + 1) % 4
-            side = np.vstack([top[k], top[k2], bottom[k2], bottom[k]])
-            faces.append(side); fcols.append(c)
-
-        # 라벨(스텝 번호)
-        # ax.text(cx, cy, cz + thickness*0.55, f"{i}", ha='center', va='bottom', fontsize=8)
-
-    pc = Poly3DCollection(faces, facecolors=fcols, edgecolors='k', linewidths=0.5, alpha=0.9)
-    # 면의 깊이 정렬 방식(가려짐 완화에 도움)
-    pc.set_zsort('min')
-    ax.add_collection3d(pc)
-
-    xs = [c[0] for c in centers]; ys = [c[1] for c in centers]; zs_all = [c[2] for c in centers]
-    xr = (min(xs)-0.8, max(xs)+0.8); yr = (min(ys)-0.8, max(ys)+0.8); zr = (min(zs_all)-0.3, max(zs_all)+0.3)
-    ax.set_xlim(*xr); ax.set_ylim(*yr); ax.set_zlim(*zr)
-    ax.set_box_aspect((xr[1]-xr[0], yr[1]-yr[0], zr[1]-zr[0]))
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
-    ax.zaxis.set_major_locator(MaxNLocator(nbins=5))
-
-    # --- colorbar (그레이스케일용; 1번/마지막은 예외 색) ---
-    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label('z [m] (height)')
-
-    plt.tight_layout(); plt.show()
-
-
-
-def stone_corners_3d(center: tuple[float,float,float], yaw_deg: float, tilt_x_deg: float, tilt_y_deg: float,
-                      size=(0.35,0.25)) -> np.ndarray:
-    """Return 4x3 array of stone corners in world frame (order around the rectangle)."""
+# -------- 3D box vertices (centered, rotated by yaw_deg) --------
+def make_box_vertices(center: Tuple[float,float,float],
+                      w: float, h: float, thickness: float,
+                      yaw_deg: float) -> np.ndarray:
+    """
+    반환: (8,3) 꼭짓점. 순서는 아래 z-면 4개 + 위 z-면 4개
+    내부 인덱스:
+      아래면: 0-1-2-3 (시계/반시계 상관 없이 일관성 유지)
+      윗면:   4-5-6-7 (아래면 각 꼭짓점 + z_off)
+    """
     cx, cy, cz = center
-    w, h = (size[0],size[1])
-    local = np.array([[-w/2, -h/2, 0.0], [ w/2, -h/2, 0.0], [ w/2,  h/2, 0.0], [-w/2,  h/2, 0.0]], dtype=float)
-    R = _Rz(math.radians(yaw_deg)) @ _Rx(math.radians(tilt_x_deg)) @ _Ry(math.radians(tilt_y_deg))
-    pts = (local @ R.T) + np.array([[cx, cy, cz]])
-    return pts
+    # 원점 기준 축정렬 직사각형의 평면 코너(아래면 z=0)
+    half = np.array([[ -w/2, -h/2, 0.0],
+                     [  w/2, -h/2, 0.0],
+                     [  w/2,  h/2, 0.0],
+                     [ -w/2,  h/2, 0.0]], dtype=float)
+
+    # z축 회전
+    Rz = _Rz_deg(yaw_deg)
+    base_xy = (Rz @ half.T).T   # (4,3)
+
+    # 아래면/윗면 z 오프셋
+    z0 = cz - thickness/2
+    z1 = cz + thickness/2
+
+    bottom = base_xy + np.array([cx, cy, z0])
+    top    = base_xy + np.array([cx, cy, z1])
+
+    V = np.vstack([bottom, top])  # (8,3)
+    return V
+
+# -------- faces from vertices --------
+def box_faces_from_vertices(V: np.ndarray) -> List[List[np.ndarray]]:
+    """
+    V: (8,3) 0..3=bottom, 4..7=top
+    반환: 각 면을 이루는 꼭짓점 리스트들의 리스트 (Poly3DCollection용)
+    """
+    b0, b1, b2, b3 = V[0], V[1], V[2], V[3]
+    t0, t1, t2, t3 = V[4], V[5], V[6], V[7]
+
+    faces = [
+        [b0, b1, b2, b3],  # bottom
+        [t0, t1, t2, t3],  # top
+        [b0, b1, t1, t0],  # side 1
+        [b1, b2, t2, t1],  # side 2
+        [b2, b3, t3, t2],  # side 3
+        [b3, b0, t0, t3],  # side 4
+    ]
+    return faces
+
+# -------- equal aspect for 3D --------
+def set_axes_equal(ax):
+    """3D 축에서 x,y,z 스케일 동일하게 맞춤"""
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    # z_limits = ax.get_zlim3d()
+    x_range = abs(x_limits[1] - x_limits[0])
+    y_range = abs(y_limits[1] - y_limits[0])
+    # z_range = abs(z_limits[1] - z_limits[0])
+    max_range = max([x_range, y_range])
+
+    x_middle = np.mean(x_limits)
+    y_middle = np.mean(y_limits)
+    # z_middle = np.mean(z_limits)
+
+    ax.set_xlim3d([x_middle - max_range/2, x_middle + max_range/2])
+    ax.set_ylim3d([y_middle - max_range/2, y_middle + max_range/2])
+    ax.set_zlim3d([-1.0, 1.0])
 
 
+def plot_stones_3d_from_json(json_path: str | Path,
+                             terrain_key: str,
+                             thickness: float = 0.04,
+                             face_alpha: float = 0.35,
+                             edgecolor: str = 'k',
+                             ax=None):
+    json_path = Path(json_path)
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
+    block = data[terrain_key]
+    stones: List[Dict[str,Any]] = block["stones"]
+
+    created_ax = False
+    if ax is None:
+        fig = plt.figure(figsize=(8,6))
+        ax = fig.add_subplot(111, projection='3d')
+        created_ax = True
+
+    n = len(stones)
+    centers_z = np.array([s["center"][2] for s in stones], dtype=float)
+
+    # 가운데 스톤 z 범위 (컬러바용)
+    use_colorbar = False
+    if n >= 3:
+        mid_z = centers_z[1:-1]
+        z_min, z_max = float(mid_z.min()), float(mid_z.max())
+        use_colorbar = z_max > z_min
+        if not use_colorbar:
+            # 모두 같은 높이면 컬러바 대신 단일 회색으로 처리
+            z_min, z_max = z_min - 0.5, z_max + 0.5
+    else:
+        # 스톤 2개 이하면 컬러바 생략
+        z_min, z_max = 0.0, 1.0
+
+    cmap = plt.get_cmap('gray')
+    norm = Normalize(vmin=z_min-0.01, vmax=z_max+0.01)
+
+    def gray_by_z(z):
+        if n < 3:
+            return (0.6, 0.6, 0.6, 1.0)
+        # cm(gray) + Normalize로 일관된 컬러바 사용
+        return cmap(norm(z))
+
+    all_xyz = []
+    for idx, s in enumerate(stones):
+        cx, cy, cz = s["center"]
+        w = float(s["width"])
+        h = float(s["height"])
+        yaw = float(s.get("yaw_deg", 0.0))
+
+        # 색상 규칙: 첫=초록, 마지막=빨강, 가운데=z기반 그레이
+        if idx == 0:
+            facecolor = (0.0, 0.7, 0.2)      # 초록
+        elif idx == n - 1:
+            facecolor = (0.9, 0.1, 0.1)      # 빨강
+        else:
+            facecolor = gray_by_z(cz)
+
+        V = make_box_vertices((cx,cy,cz), w, h, thickness, yaw)
+        faces = box_faces_from_vertices(V)
+        poly = Poly3DCollection(
+            faces, alpha=face_alpha, edgecolor=edgecolor, facecolor=facecolor
+        )
+        ax.add_collection3d(poly)
+        all_xyz.append(V)
+
+        # # yaw 방향 화살표 (색을 스톤 색과 맞춤)
+        # arrow_len = 0.5 * max(w, h)
+        # dir_vec = (_Rz_deg(yaw) @ np.array([arrow_len, 0.0, 0.0])).reshape(3)
+        # ax.quiver(cx, cy, cz, dir_vec[0], dir_vec[1], 0.0,
+        #           length=1.0, normalize=False, color=facecolor)
+
+    # 축 범위 자동 설정 (NumPy 2.0 호환)
+    if all_xyz:
+        P = np.vstack(all_xyz)  # (N*8, 3)
+        rng_x = np.ptp(P[:, 0])
+        rng_y = np.ptp(P[:, 1])
+        rng_z = np.ptp(P[:, 2])
+        pad = 0.1 * max(rng_x, rng_y, rng_z, 1e-6)
+
+        ax.set_xlim(P[:, 0].min() - pad, P[:, 0].max() + pad)
+        ax.set_ylim(P[:, 1].min() - pad, P[:, 1].max() + pad)
+        ax.set_zlim(P[:, 2].min() - pad, P[:, 2].max() + pad)
+
+
+    set_axes_equal(ax)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title(f" Generated Stepping Stones(VAE) ")
+    ax.grid(False)
+    ax.view_init(elev=30, azim=-110)
+    # 범례(패치) + 가운데 스톤 그레이스케일 컬러바
+    legend_patches = []
+    if n >= 1:
+        legend_patches.append(Patch(facecolor=(0.0, 0.7, 0.2), edgecolor='k', label='First stone'))
+    if n >= 2:
+        legend_patches.append(Patch(facecolor=(0.9, 0.1, 0.1), edgecolor='k', label='Last stone'))
+    if n >= 3:
+        # 가운데 스톤들은 컬러바로 설명
+        if legend_patches:
+            ax.legend(handles=legend_patches, loc='upper right')
+        else:
+            ax.legend(handles=[
+                Patch(facecolor=(0.0, 0.7, 0.2), edgecolor='k', label='First stone'),
+                Patch(facecolor=(0.9, 0.1, 0.1), edgecolor='k', label='Last stone'),
+            ], loc='upper right')
+
+        if use_colorbar:
+            # 이전 플롯처럼 오른쪽에 높이 범례(컬러바) 추가
+            # (Axes가 하나라면 fig를 ax.figure로 안전하게 획득)
+            fig = ax.figure
+            mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+            mappable.set_array([])  # Matplotlib 경고 방지용
+            cbar = fig.colorbar(mappable, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label('Height (z)', rotation=90)
+        else:
+            # 모든 z가 동일하면 텍스트로 표기
+            ax.text2D(0.98, 0.94, "Middle stones: constant height",
+                      transform=ax.transAxes, ha='right', va='top')
+    else:
+        if legend_patches:
+            ax.legend(handles=legend_patches, loc='upper right')
+
+    if created_ax:
+        plt.tight_layout()
+        plt.show()
 
 
 # ============================
@@ -557,10 +732,10 @@ def main():
     Z_DIM    = 8
 
     # 시퀀스 생성 파라미터
-    STEPS_GEN   = 10        # generate_sequence로 생성할 길이
-    A_VARIANCE  = 0.5      # z ~ N(0, (1+a) I) 의 a (다양성↑: a>0, 보수적: -1<a<0)
+    STEPS_GEN   = 4        # generate_sequence로 생성할 길이
+    A_VARIANCE  = 0.0      # z ~ N(0, (1+a) I) 의 a (다양성↑: a>0, 보수적: -1<a<0)
     YAW0_DEG    = 0.0       # 절대 누적 시작 yaw (deg)
-    START_CENTER= (0.0, 0.0, 0.0)  # 초기 스톤 중심
+    START_CENTER= (0.0, 2.5, 0.0)  # 초기 스톤 중심
     START_SIZE  = (0.30, 0.30)     # 초기 스톤 크기 (w,h)
     THICKNESS   = 0.04      # 3D 블록 두께
 
@@ -590,12 +765,24 @@ def main():
     # --------- [F] 시드 델타 2개 설정 (필요에 따라 조정) ---------
     # d0/d1은 "델타"이므로, 절대 위치가 아니라 다음 스텝으로의 변화량(단위 m, deg)
     d0 = Step6(0.00, 0.00, 0.00, 0.00, 0.00, 0.00)  # 첫 변화량
-    d1 = Step6(0.20, 0.00, 0.00, 0.00, 0.00, 0.00)  # 살짝 x 전진
+    d1 = Step6(0.40, 0.00, 0.00, 0.00, 0.00, 0.00)  # 살짝 x 전진
 
     # --------- [G] 시퀀스 생성 (a로 샘플 다양성 조절) ---------
     seq = generate_sequence(
         model, d0, d1,
         steps=STEPS_GEN, a=A_VARIANCE, device=device
+    )
+
+    # --------- [G2] CVAE_steppingstone 결과를 terrain JSON으로 저장 ---------
+    json_path, terrain_key = vae_seq_to_terrain_json(
+        seq,
+        center0=START_CENTER,
+        size0=START_SIZE,
+        yaw0_deg=YAW0_DEG,
+        terrain_key="vae_run",  # 원하면 런마다 다른 이름 사용
+        json_path="vae_terrain.json",  # 경로 고정/변경 자유
+        use_from=2,  # d0,d1 제외
+        copy_counts=None  # 필요 시 [1]*N 등으로 전달
     )
 
     # --------- [H] 통계 출력 (6D 모두) ---------
@@ -612,15 +799,8 @@ def main():
             print(f"[gen] {k}: min={min(v):.3f} mean={sum(v)/len(v):.3f} max={max(v):.3f}")
 
     # --------- [I] 시각화 (yaw 반영)
-    plot_sequence_3d_deltas(
-        seq,
-        center0=START_CENTER,
-        size0=START_SIZE,
-        thickness=THICKNESS,
-        yaw0_deg=YAW0_DEG,  # 누적 시작 yaw
-        title="Generated stepping stone",
-        equalize_axes= True
-    )
+    plot_stones_3d_from_json("vae_terrain.json", terrain_key="vae_run",
+                             thickness=0.04, face_alpha=0.95, edgecolor='k')
 
 
 if __name__ == "__main__":
