@@ -10,3 +10,4 @@ dependencies:
   - sympy          # 쓰면
   - pytorch        # or pytorch-cpu, 환경에 맞게
   - torchvision
+

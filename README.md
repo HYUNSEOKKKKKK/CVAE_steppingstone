@@ -31,7 +31,7 @@ This installs:
 CVAE_steppingstone/
 ├── environment.yml        
 ├── main.py                # Entry point for VAE generation
-└── README.md
+└── README.md  
 ```
 
 ---
