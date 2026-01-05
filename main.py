@@ -157,7 +157,7 @@ def angle_ar_blend(prev_deg: float, new_deg: float, alpha: float) -> float:
 
 # ==== Normalization helpers for Step6 (dx,dy,dz,dw,dh,dyaw_deg) ====
 # 대략적 스케일로 나눠 [-1,1] 근처. 마지막 항은 각도(°) 스케일.
-SCALE6 = torch.tensor([0.2, 0.2, 0.1, 0.11, 0.11, 180.0], dtype=torch.float32)  # 45° 기준 (환경에 맞게 조정)
+SCALE6 = torch.tensor([0.5, 0.3, 0.2, 0.1, 0.1, 180.0], dtype=torch.float32)  # 45° 기준 (환경에 맞게 조정)
 
 def normalize_step_tensor(x: torch.Tensor) -> torch.Tensor:
     # x: (..., 6)
@@ -196,11 +196,11 @@ class SyntheticStepDeltaDataset(Dataset):
 
         def sample_delta(prev: Optional[Step6], prev2: Optional[Step6]) -> Step6:
             # 기본 균등 + 연속성(약한 AR)
-            dx   = g.uniform(0.30, 0.60)
+            dx   = g.uniform(0.3, 0.5)
             dy   = g.uniform(-0.15, 0.15)
             dz   = g.uniform(-0.1, 0.1)
-            dw   = g.uniform(-0.06, 0.05)
-            dh   = g.uniform(-0.06, 0.05)
+            dw   = g.uniform(-0.02, 0.08)
+            dh   = g.uniform(-0.08, 0.02)
             dyaw = g.uniform(-90, 90)   # °-90,90
 
             if prev:
@@ -628,8 +628,8 @@ def plot_stones_3d_from_json(json_path: str | Path,
     all_xyz = []
     for idx, s in enumerate(stones):
         cx, cy, cz = s["center"]
-        w = float(s["width"])
-        h = float(s["height"])
+        w = float(s["width"]) +0.15
+        h = float(s["height"]) +0.15
         yaw = float(s.get("yaw_deg", 0.0))
 
         # 색상 규칙: 첫=초록, 마지막=빨강, 가운데=z기반 그레이
@@ -714,94 +714,107 @@ def plot_stones_3d_from_json(json_path: str | Path,
 # ============================
 # 7) Main (yaw 포함 6D 설정)
 # ============================
+import os, random
+import numpy as np
+import torch
+
+def seed_all(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def main():
-    # --------- [A] 공통 세팅 / 하이퍼파라미터 ---------
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 데이터셋/로더
-    DATA_LEN   = 20000      # 합성 데이터 개수
-    SEED       = 123        # 재현용 시드
+    DATA_LEN   = 40000
+    SEED       = 123
     BATCH_SIZE = 512
     EPOCHS     = 50
     LR         = 2e-4
 
-    # CVAE 차원 (6D delta = [dx,dy,dz,dw,dh,dyaw], cond = prev2(6)+prev1(6)=12)
     COND_DIM = 12
     X_DIM    = 6
     Z_DIM    = 8
 
-    # 시퀀스 생성 파라미터
-    STEPS_GEN   = 4        # generate_sequence로 생성할 길이
-    A_VARIANCE  = 0.0      # z ~ N(0, (1+a) I) 의 a (다양성↑: a>0, 보수적: -1<a<0)
-    YAW0_DEG    = 0.0       # 절대 누적 시작 yaw (deg)
-    START_CENTER= (0.0, 2.5, 0.0)  # 초기 스톤 중심
-    START_SIZE  = (0.30, 0.30)     # 초기 스톤 크기 (w,h)
-    THICKNESS   = 0.04      # 3D 블록 두께
+    STEPS_GEN   = 5
+    A_VARIANCE  = 0.0
+    YAW0_DEG    = 0.0
+    START_CENTER= (0.0, 2.5, 0.0)
+    START_SIZE  = (0.3, 0.5)
+    THICKNESS   = 0.04
 
     CKPT_PATH = "cvae_mapgen.pt"
 
-    # --------- [B] 데이터셋 준비 (6D 버전) ---------
+    # ✅ 여기만 추가: 생성할 개수 + 저장 폴더
+    NUM_SAMPLES = 3
+    OUT_DIR = "vae_terrains"
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    # --------- [B] 데이터셋 준비 ---------
     ds = SyntheticStepDeltaDataset(length=DATA_LEN, seed=SEED)
     n_train = int(0.9 * len(ds))
     train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, len(ds) - n_train])
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # --------- [C] 모델 구성 (6D에 맞춤) ---------
+    # --------- [C] 모델 ---------
     model = CVAE(cond_dim=COND_DIM, x_dim=X_DIM, z_dim=Z_DIM)
 
-    # --------- [D] 학습 ---------
+    #한번은 항상 학습
     train_cvae(
         model, train_loader, val_loader,
         epochs=EPOCHS, lr=LR, device=device, ckpt_path=CKPT_PATH
     )
 
-    # --------- [E] 최고 성능 체크포인트 로드 ---------
+    # --------- [E] 체크포인트 로드 ---------
     ckpt = torch.load(CKPT_PATH, map_location=device)
     model.load_state_dict(ckpt["model"])
     model.to(device)
+    model.eval()  # ✅ 중요: 샘플링 모드
 
-    # --------- [F] 시드 델타 2개 설정 (필요에 따라 조정) ---------
-    # d0/d1은 "델타"이므로, 절대 위치가 아니라 다음 스텝으로의 변화량(단위 m, deg)
-    d0 = Step6(0.00, 0.00, 0.00, 0.00, 0.00, 0.00)  # 첫 변화량
-    d1 = Step6(0.40, 0.00, 0.00, 0.00, 0.00, 0.00)  # 살짝 x 전진
+    # --------- [F] 시드 델타 2개 ---------
+    d0 = Step6(0.00, 0.00, 0.00, 0.00, 0.00, 0.00)
+    d1 = Step6(0.40, 0.00, 0.00, 0.00, 0.00, 0.00)
 
-    # --------- [G] 시퀀스 생성 (a로 샘플 다양성 조절) ---------
-    seq = generate_sequence(
-        model, d0, d1,
-        steps=STEPS_GEN, a=A_VARIANCE, device=device
+    # --------- [G~] 여러 개 생성/저장 ---------
+    with torch.no_grad():
+        for i in range(NUM_SAMPLES):
+            # ✅ 매번 다른 랜덤 샘플을 원하면 시드만 바꿔주면 됨
+            seed_all(SEED + i)
+
+            seq = generate_sequence(
+                model, d0, d1,
+                steps=STEPS_GEN, a=A_VARIANCE, device=device
+            )
+
+            terrain_key = "terrain"  # ✅ 항상 고정
+            json_path = f"vae_terrains/run_{i:03d}.json"  # ✅ 파일명만 다르게
+            vae_seq_to_terrain_json(
+                seq,
+                center0=START_CENTER,
+                size0=START_SIZE,
+                yaw0_deg=YAW0_DEG,
+                terrain_key=terrain_key,
+                json_path=json_path,
+                use_from=2,
+                copy_counts=None
+            )
+
+            print(f"[saved] {json_path}")
+
+    # (원하면 마지막 생성 결과만 시각화)
+    last_json = os.path.join(OUT_DIR, f"run_{NUM_SAMPLES - 1:03d}.json")
+    last_key = "terrain"  # 너가 고정해둔 key
+    plot_stones_3d_from_json(
+        last_json,
+        terrain_key=last_key,
+        thickness=THICKNESS,
+        face_alpha=0.95,
+        edgecolor='k'
     )
-
-    # --------- [G2] CVAE_steppingstone 결과를 terrain JSON으로 저장 ---------
-    json_path, terrain_key = vae_seq_to_terrain_json(
-        seq,
-        center0=START_CENTER,
-        size0=START_SIZE,
-        yaw0_deg=YAW0_DEG,
-        terrain_key="vae_run",  # 원하면 런마다 다른 이름 사용
-        json_path="vae_terrain.json",  # 경로 고정/변경 자유
-        use_from=2,  # d0,d1 제외
-        copy_counts=None  # 필요 시 [1]*N 등으로 전달
-    )
-
-    # --------- [H] 통계 출력 (6D 모두) ---------
-    vals = {
-        "dx [m]":   [p.dx   for p in seq[2:]],
-        "dy [m]":   [p.dy   for p in seq[2:]],
-        "dz [m]":   [p.dz   for p in seq[2:]],
-        "dw [m]":   [p.dw   for p in seq[2:]],
-        "dh [m]":   [p.dh   for p in seq[2:]],
-        "dyaw [°]": [p.dyaw for p in seq[2:]],
-    }
-    for k, v in vals.items():
-        if len(v) > 0:
-            print(f"[gen] {k}: min={min(v):.3f} mean={sum(v)/len(v):.3f} max={max(v):.3f}")
-
-    # --------- [I] 시각화 (yaw 반영)
-    plot_stones_3d_from_json("vae_terrain.json", terrain_key="vae_run",
-                             thickness=0.04, face_alpha=0.95, edgecolor='k')
 
 
 if __name__ == "__main__":
     main()
+
