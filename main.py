@@ -157,7 +157,7 @@ def angle_ar_blend(prev_deg: float, new_deg: float, alpha: float) -> float:
 
 # ==== Normalization helpers for Step6 (dx,dy,dz,dw,dh,dyaw_deg) ====
 # 대략적 스케일로 나눠 [-1,1] 근처. 마지막 항은 각도(°) 스케일.
-SCALE6 = torch.tensor([0.5, 0.3, 0.2, 0.1, 0.1, 180.0], dtype=torch.float32)  # 45° 기준 (환경에 맞게 조정)
+SCALE6 = torch.tensor([0.5, 0.3, 0.2, 0.12, 0.12, 40.0], dtype=torch.float32)  # 45° 기준 (환경에 맞게 조정)
 
 def normalize_step_tensor(x: torch.Tensor) -> torch.Tensor:
     # x: (..., 6)
@@ -196,12 +196,12 @@ class SyntheticStepDeltaDataset(Dataset):
 
         def sample_delta(prev: Optional[Step6], prev2: Optional[Step6]) -> Step6:
             # 기본 균등 + 연속성(약한 AR)
-            dx   = g.uniform(0.3, 0.5)
+            dx   = g.uniform(0.2, 0.7)
             dy   = g.uniform(-0.15, 0.15)
             dz   = g.uniform(-0.1, 0.1)
-            dw   = g.uniform(-0.02, 0.08)
-            dh   = g.uniform(-0.08, 0.02)
-            dyaw = g.uniform(-90, 90)   # °-90,90
+            dw   = g.uniform(-0.06, 0.06)
+            dh   = g.uniform(-0.06, 0.06)
+            dyaw = g.uniform(-20, 20)   # °-90,90
 
             if prev:
                 # 약한 관성(이전 델타와 섞기) — 위치/크기: 선형, 각도: 최단각 기반
@@ -628,8 +628,8 @@ def plot_stones_3d_from_json(json_path: str | Path,
     all_xyz = []
     for idx, s in enumerate(stones):
         cx, cy, cz = s["center"]
-        w = float(s["width"]) +0.15
-        h = float(s["height"]) +0.15
+        w = float(s["width"])    #0.15
+        h = float(s["height"])
         yaw = float(s.get("yaw_deg", 0.0))
 
         # 색상 규칙: 첫=초록, 마지막=빨강, 가운데=z기반 그레이
@@ -673,7 +673,8 @@ def plot_stones_3d_from_json(json_path: str | Path,
     ax.set_zlabel("Z")
     ax.set_title(f" Generated Stepping Stones(VAE) ")
     ax.grid(False)
-    ax.view_init(elev=30, azim=-110)
+    ax.set_axis_off()
+    ax.view_init(elev=22, azim=-134)
     # 범례(패치) + 가운데 스톤 그레이스케일 컬러바
     legend_patches = []
     if n >= 1:
@@ -737,16 +738,16 @@ def main():
     X_DIM    = 6
     Z_DIM    = 8
 
-    STEPS_GEN   = 5
+    STEPS_GEN   = 6
     A_VARIANCE  = 0.0
     YAW0_DEG    = 0.0
     START_CENTER= (0.0, 2.5, 0.0)
-    START_SIZE  = (0.3, 0.5)
+    START_SIZE  = (0.2, 0.4)
     THICKNESS   = 0.04
 
     CKPT_PATH = "cvae_mapgen.pt"
 
-    # ✅ 여기만 추가: 생성할 개수 + 저장 폴더
+    # ✅ 여기만 추가: 생성할 개수 + 저장 폴1
     NUM_SAMPLES = 3
     OUT_DIR = "vae_terrains"
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -775,7 +776,7 @@ def main():
 
     # --------- [F] 시드 델타 2개 ---------
     d0 = Step6(0.00, 0.00, 0.00, 0.00, 0.00, 0.00)
-    d1 = Step6(0.40, 0.00, 0.00, 0.00, 0.00, 0.00)
+    d1 = Step6(0.30, 0.00, 0.00, 0.00, 0.00, 0.00)
 
     # --------- [G~] 여러 개 생성/저장 ---------
     with torch.no_grad():
